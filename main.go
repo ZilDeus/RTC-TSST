@@ -296,7 +296,7 @@ func convertMp3ToOgg(fileName string) error {
 	mp3Path := filepath.Join(dir, fmt.Sprintf("%s.mp3", fileName))
 	oggPath := filepath.Join(dir, fmt.Sprintf("%s.ogg", fileName))
 
-	cmd := exec.Command("ffmpeg", "-y", "-i", mp3Path, oggPath)
+	cmd := exec.Command("ffmpeg", "-y", "-i", mp3Path, "-c:a", "libopus", "-page_duration", "20000", oggPath)
 
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Error converting %s: %v\n", oggPath, err)
