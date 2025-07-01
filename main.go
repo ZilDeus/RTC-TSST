@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,49 +14,27 @@ import (
 	_ "os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/pion/interceptor"
-	"github.com/pion/interceptor/pkg/intervalpli"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
-	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
+	_ "github.com/pion/webrtc/v4/pkg/media/oggwriter"
 )
 
 var (
-	peerConnection        *webrtc.PeerConnection
-	api                   *webrtc.API
-	outputTrack           *webrtc.TrackLocalStaticSample
-	initOnce              sync.Once
-	closeChannel          chan bool
-	oggPageDuration       = time.Millisecond * 20
-	iceConnectedCtx       context.Context
-	iceConnectedCtxCancel context.Context
+	peerConnection  *webrtc.PeerConnection
+	oggPageDuration = time.Millisecond * 20
+	outputTrack     *webrtc.TrackLocalStaticSample
 )
 
-func cleanup() {
-	fmt.Println("Cleanup")
-	files, err := os.ReadDir("./")
-	if err != nil {
-		fmt.Println("reading dir failed: %w", err)
-		return
-	}
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".ogg") || strings.HasSuffix(file.Name(), ".wav") || strings.HasSuffix(file.Name(), ".txt") {
-			if err := os.Remove(file.Name()); err != nil {
-				fmt.Printf("Failed to delete %s: %v\n", file.Name(), err)
-			}
-		}
-	}
-}
+/* usefult functions , don't change them */
 
 type TranscriptionResponse struct {
 	Text string `json:"text"`
 }
 
-func getSpeechFromText(text string) error {
+func getSpeechFromText(text string, output string) error {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 
 	url := "https://api.openai.com/v1/audio/speech"
@@ -75,7 +52,6 @@ func getSpeechFromText(text string) error {
 		return err
 	}
 
-	// Create HTTP POST request
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Println("Error creating request:", err)
@@ -84,7 +60,6 @@ func getSpeechFromText(text string) error {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Send the request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -93,8 +68,8 @@ func getSpeechFromText(text string) error {
 	}
 	defer resp.Body.Close()
 
-	// Create output file
-	outFile, err := os.Create("final.mp3")
+	outputFileName := fmt.Sprintf("%s.mp3", output)
+	outFile, err := os.Create(outputFileName)
 	if err != nil {
 		fmt.Println("Error creating output file:", err)
 		return err
@@ -107,80 +82,9 @@ func getSpeechFromText(text string) error {
 		return err
 	}
 
-	fmt.Println("Speech saved to final.mp3")
+	fmt.Printf("Speech saved to %s\n", outputFileName)
 
 	return nil
-}
-
-func writeToTrack(fileName string) {
-	fmt.Println("writeToTrack")
-	//audioTrack, audioTrackErr := webrtc.NewTrackLocalStaticSample(
-	//	webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion",
-	//)
-	//if audioTrackErr != nil {
-	//	panic(audioTrackErr)
-	//}
-
-	//rtpSender, audioTrackErr := peerConnection.AddTrack(audioTrack)
-	//if audioTrackErr != nil {
-	//	panic(audioTrackErr)
-	//}
-	// Read incoming RTCP packets
-	// Before these packets are returned they are processed by interceptors. For things
-	// like NACK this needs to be called.
-	//go func() {
-	//	rtcpBuf := make([]byte, 1500)
-	//	for {
-	//		if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
-	//			return
-	//		}
-	//	}
-	//}()
-
-	go func() {
-		file, oggErr := os.Open(fileName)
-		if oggErr != nil {
-			fmt.Println("in os.Open")
-			panic(oggErr)
-		}
-
-		// Open on oggfile in non-checksum mode.
-		ogg, _, oggErr := oggreader.NewWith(file)
-		if oggErr != nil {
-			fmt.Println("in oggreader")
-			panic(oggErr)
-		}
-
-		var lastGranule uint64
-
-		<-iceConnectedCtx.Done()
-		// It is important to use a time.Ticker instead of time.Sleep because
-		// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-		// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
-		ticker := time.NewTicker(oggPageDuration)
-		defer ticker.Stop()
-		for ; true; <-ticker.C {
-			pageData, pageHeader, oggErr := ogg.ParseNextPage()
-			if errors.Is(oggErr, io.EOF) {
-				fmt.Printf("All audio pages parsed and sent")
-				os.Exit(0)
-			}
-
-			if oggErr != nil {
-				panic(oggErr)
-			}
-
-			// The amount of samples is the difference between the last and current timestamp
-			sampleCount := float64(pageHeader.GranulePosition - lastGranule)
-			lastGranule = pageHeader.GranulePosition
-			sampleDuration := time.Duration((sampleCount/48000)*1000) * time.Millisecond
-			rtpPacket := media.Sample{Data: pageData, Duration: sampleDuration}
-			if oggErr := outputTrack.WriteSample(rtpPacket); oggErr != nil {
-				fmt.Println("in write Sample")
-				panic(oggErr)
-			}
-		}
-	}()
 }
 
 func getTextFromSpeech(fileName string) (string, error) {
@@ -254,40 +158,7 @@ func getTextFromSpeech(fileName string) (string, error) {
 		fmt.Println("Error parsing JSON:", err)
 		return "", err
 	}
-
 	return result.Text, nil
-}
-
-func printTranscription(fileName string) {
-
-	txtFileName := fmt.Sprintf("%s.txt", fileName)
-
-	cmd := exec.Command("./bin/whisper-cli", "-l", "auto", "-m", "./models/ggml-large-v3-turbo-q5_0.bin", "-np", "-otxt", "-f", fileName)
-
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Error running whisper %s: %v\n", fileName, err)
-		return
-	}
-
-	//if err := os.Remove(fileName); err != nil {
-	//	fmt.Printf("Failed to delete %s: %v\n", fileName, err)
-	//} else {
-	//	fmt.Printf("Deleted: %s\n", fileName)
-	//}
-
-	readCmd := exec.Command("cat", txtFileName)
-
-	readCmd.Stdout = os.Stdout
-
-	if err := readCmd.Run(); err != nil {
-		fmt.Println("error reading txt output")
-		fmt.Println(err)
-	}
-
-	//if err := os.Remove(txtFileName); err != nil {
-	//	fmt.Println("error deleting txt output")
-	//	fmt.Println(err)
-	//}
 }
 
 func convertMp3ToOgg(fileName string) error {
@@ -303,11 +174,6 @@ func convertMp3ToOgg(fileName string) error {
 		return err
 	}
 
-	// Delete original OGG after successful conversion
-	//if err := os.Remove(oggPath); err != nil {
-	//	fmt.Printf("Failed to delete %s: %v\n", oggPath, err)
-	//	return err
-	//}
 	return nil
 }
 
@@ -324,11 +190,6 @@ func convertOggToMp3(fileName string) error {
 		return err
 	}
 
-	// Delete original OGG after successful conversion
-	//if err := os.Remove(oggPath); err != nil {
-	//	fmt.Printf("Failed to delete %s: %v\n", oggPath, err)
-	//	return err
-	//}
 	return nil
 }
 
@@ -341,7 +202,7 @@ func saveToDisk(writer media.Writer, track *webrtc.TrackRemote) {
 	exist := false
 	go func() {
 		fmt.Println("listening to close channel")
-		<-closeChannel
+		//<-closeChannel
 		fmt.Printf("got close signal")
 		exist = true
 	}()
@@ -381,16 +242,100 @@ func withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 }
 
+func createWebRtcConnection() {
+	var err error
+	peerConnection, err = webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
+	if err != nil {
+		return
+	}
+
+	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		fmt.Printf("Connection state: %s\n", state.String())
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+			fmt.Println("Peer Connection ended, exiting")
+			os.Exit(0)
+		}
+	})
+
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		//for {
+		//	fileName := "output"
+		//	oggFile, err := oggwriter.New(fmt.Sprintf("%s.ogg", fileName), 48000, 2)
+		//	if err != nil {
+		//		fmt.Println("Failed to create ogg file:", err)
+		//		continue
+		//	}
+		//	saveToDisk(oggFile, track)
+		//	err = convertOggToMp3(fileName)
+		//	if err != nil {
+		//		fmt.Println("Failed to convert ogg to wav:", err)
+		//		continue
+		//	}
+		//	var text string
+		//	text, err = getTextFromSpeech(fmt.Sprintf("%s.mp3", fileName))
+		//	if err != nil {
+		//		fmt.Println("Failed to text from audio:", err)
+		//		continue
+		//	}
+		//	fmt.Println(text)
+		//	err = getSpeechFromText(fmt.Sprintf("this was the users text %s \n my response is very cool, nice one , great, text,text text.", text))
+		//	if err != nil {
+		//		fmt.Println("Failed to get audio from text:", err)
+		//		continue
+		//	}
+		//	err = convertMp3ToOgg("final")
+		//}
+	})
+
+	outputTrack, err = webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion",
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	rtpSender, err := peerConnection.AddTrack(outputTrack)
+	if err != nil {
+		panic(err)
+	}
+
+	// Read incoming RTCP packets
+	// Before these packets are returned they are processed by interceptors. For things
+	// like NACK this needs to be called.
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
+
+	select {}
+}
+
 func main() {
-	closeChannel = make(chan bool)
-	defer cleanup()
+
 	http.HandleFunc("/offer", withCORS(offerHandler))
-	http.HandleFunc("/stop", withCORS(func(w http.ResponseWriter, r *http.Request) { go stopRecording() }))
-	http.HandleFunc("/start", withCORS(func(w http.ResponseWriter, r *http.Request) { go startRecording() }))
+	http.HandleFunc("/play", withCORS(func(w http.ResponseWriter, r *http.Request) { go playAudio() }))
+
+	//http.HandleFunc("/stop", withCORS(func(w http.ResponseWriter, r *http.Request) { go stopRecording() }))
+	//http.HandleFunc("/start", withCORS(func(w http.ResponseWriter, r *http.Request) { go startRecording() }))
+
+	fmt.Println("starting webrtc server")
+	go createWebRtcConnection()
 
 	fmt.Println("Server started on :3000")
 
 	err := http.ListenAndServe(":3000", nil)
+
 	if err != nil {
 		panic(err)
 	}
@@ -398,17 +343,88 @@ func main() {
 
 func stopRecording() {
 	fmt.Println("Stop")
-	closeChannel <- true
+	//closeChannel <- true
+	//isConnected <- true
 	fmt.Println("Added to closeChannel true")
 }
 
 func startRecording() {
 	fmt.Println("Start")
-	closeChannel <- false
+	//closeChannel <- false
 	fmt.Println("Added to closeChannel false")
 }
 
+func encode(obj *webrtc.SessionDescription) string {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func decode(in string, obj *webrtc.SessionDescription) error {
+	b, err := base64.StdEncoding.DecodeString(in)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, obj)
+}
+
+/* usefult functions , don't change them */
+
+/* bad code, clean this shit out please */
+
+func playAudio() {
+
+	go func() {
+		// Open a OGG file and start reading using our OGGReader
+		file, oggErr := os.Open("final.ogg")
+		if oggErr != nil {
+			panic(oggErr)
+		}
+
+		// Open on oggfile in non-checksum mode.
+		ogg, _, oggErr := oggreader.NewWith(file)
+		if oggErr != nil {
+			panic(oggErr)
+		}
+
+		// Keep track of last granule, the difference is the amount of samples in the buffer
+		var lastGranule uint64
+
+		// It is important to use a time.Ticker instead of time.Sleep because
+		// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
+		// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
+		ticker := time.NewTicker(oggPageDuration)
+		defer ticker.Stop()
+		for ; true; <-ticker.C {
+			pageData, pageHeader, oggErr := ogg.ParseNextPage()
+			if errors.Is(oggErr, io.EOF) {
+				fmt.Printf("All audio pages parsed and sent")
+				return
+			}
+
+			if oggErr != nil {
+				panic(oggErr)
+			}
+
+			// The amount of samples is the difference between the last and current timestamp
+			sampleCount := float64(pageHeader.GranulePosition - lastGranule)
+			lastGranule = pageHeader.GranulePosition
+			sampleDuration := time.Duration((sampleCount/48000)*1000) * time.Millisecond
+			fmt.Printf("%d %f %d\n", pageHeader.GranulePosition, sampleCount, sampleDuration)
+
+			if oggErr = outputTrack.WriteSample(media.Sample{Data: pageData, Duration: sampleDuration}); oggErr != nil {
+				panic(oggErr)
+			}
+			fmt.Println("sent audio")
+		}
+	}()
+	select {}
+}
+
 func offerHandler(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
 		return
@@ -424,15 +440,6 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
 	var offer webrtc.SessionDescription
 	if err := decode(strings.TrimSpace(string(body)), &offer); err != nil {
 		http.Error(w, "invalid SDP format", http.StatusBadRequest)
-		return
-	}
-
-	var pcErr error
-	initOnce.Do(func() {
-		pcErr = initializePeerConnection()
-	})
-	if pcErr != nil {
-		http.Error(w, "failed to init peer connection", http.StatusInternalServerError)
 		return
 	}
 
@@ -459,118 +466,7 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
 	encoded := encode(peerConnection.LocalDescription())
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(encoded))
+
 }
 
-func initializePeerConnection() error {
-	mediaEngine := &webrtc.MediaEngine{}
-	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
-		},
-	}, webrtc.RTPCodecTypeAudio); err != nil {
-		return err
-	}
-
-	interceptorRegistry := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
-		return err
-	}
-	intervalPliFactory, err := intervalpli.NewReceiverInterceptor()
-	if err != nil {
-		return err
-	}
-	interceptorRegistry.Add(intervalPliFactory)
-
-	api = webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(interceptorRegistry))
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	}
-	peerConnection, err = api.NewPeerConnection(config)
-	if err != nil {
-		return err
-	}
-
-	outputTrack, err = webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion",
-	)
-	if err != nil {
-		return err
-	}
-	iceConnectedCtx = context.Background()
-
-	rtpSender, err := peerConnection.AddTrack(outputTrack)
-	if err != nil {
-		return err
-	}
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, err := rtpSender.Read(rtcpBuf); err != nil {
-				return
-			}
-		}
-	}()
-
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		for {
-			fileName := "output"
-			oggFile, err := oggwriter.New(fmt.Sprintf("%s.ogg", fileName), 48000, 2)
-			if err != nil {
-				fmt.Println("Failed to create ogg file:", err)
-				continue
-			}
-			saveToDisk(oggFile, track)
-			err = convertOggToMp3(fileName)
-			if err != nil {
-				fmt.Println("Failed to convert ogg to wav:", err)
-				continue
-			}
-			//printing is to slow
-			//printTranscription(fmt.Sprintf("%s.wav", fileName))
-			var text string
-			text, err = getTextFromSpeech(fmt.Sprintf("%s.mp3", fileName))
-			if err != nil {
-				fmt.Println("Failed to text from audio:", err)
-				continue
-			}
-			fmt.Println(text)
-			err = getSpeechFromText(fmt.Sprintf("this was the users text %s \n my response is very cool, nice one , great, text,text text.", text))
-			if err != nil {
-				fmt.Println("Failed to get audio from text:", err)
-				continue
-			}
-			err = convertMp3ToOgg("final")
-			writeToTrack("final.ogg")
-			//"ffmpeg -i input.mp3 -codec:a libvorbis output.ogg"
-		}
-	})
-
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		fmt.Printf("Connection state: %s\n", state.String())
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			fmt.Println("Peer Connection ended, exiting")
-			os.Exit(0)
-		}
-	})
-
-	return nil
-}
-
-func encode(obj *webrtc.SessionDescription) string {
-	b, err := json.Marshal(obj)
-	if err != nil {
-		panic(err)
-	}
-	return base64.StdEncoding.EncodeToString(b)
-}
-
-func decode(in string, obj *webrtc.SessionDescription) error {
-	b, err := base64.StdEncoding.DecodeString(in)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(b, obj)
-}
+/* bad code, clean this shit out please */
