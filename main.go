@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pion/webrtc/v3/pkg/media/oggwriter"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/pion/webrtc/v4/pkg/media/oggreader"
@@ -26,6 +27,7 @@ var (
 	peerConnection  *webrtc.PeerConnection
 	oggPageDuration = time.Millisecond * 20
 	outputTrack     *webrtc.TrackLocalStaticSample
+	closeChannel    chan bool
 )
 
 /* usefult functions , don't change them */
@@ -202,7 +204,7 @@ func saveToDisk(writer media.Writer, track *webrtc.TrackRemote) {
 	exist := false
 	go func() {
 		fmt.Println("listening to close channel")
-		//<-closeChannel
+		<-closeChannel
 		fmt.Printf("got close signal")
 		exist = true
 	}()
@@ -264,33 +266,38 @@ func createWebRtcConnection() {
 	})
 
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		//for {
-		//	fileName := "output"
-		//	oggFile, err := oggwriter.New(fmt.Sprintf("%s.ogg", fileName), 48000, 2)
-		//	if err != nil {
-		//		fmt.Println("Failed to create ogg file:", err)
-		//		continue
-		//	}
-		//	saveToDisk(oggFile, track)
-		//	err = convertOggToMp3(fileName)
-		//	if err != nil {
-		//		fmt.Println("Failed to convert ogg to wav:", err)
-		//		continue
-		//	}
-		//	var text string
-		//	text, err = getTextFromSpeech(fmt.Sprintf("%s.mp3", fileName))
-		//	if err != nil {
-		//		fmt.Println("Failed to text from audio:", err)
-		//		continue
-		//	}
-		//	fmt.Println(text)
-		//	err = getSpeechFromText(fmt.Sprintf("this was the users text %s \n my response is very cool, nice one , great, text,text text.", text))
-		//	if err != nil {
-		//		fmt.Println("Failed to get audio from text:", err)
-		//		continue
-		//	}
-		//	err = convertMp3ToOgg("final")
-		//}
+		for {
+			fileName := "output"
+			oggFile, err := oggwriter.New(fmt.Sprintf("%s.ogg", fileName), 48000, 2)
+			if err != nil {
+				fmt.Println("Failed to create ogg file:", err)
+				continue
+			}
+			saveToDisk(oggFile, track)
+			err = convertOggToMp3(fileName)
+			if err != nil {
+				fmt.Println("Failed to convert ogg to wav:", err)
+				continue
+			}
+			var text string
+			text, err = getTextFromSpeech(fmt.Sprintf("%s.mp3", fileName))
+			if err != nil {
+				fmt.Println("Failed to text from audio:", err)
+				continue
+			}
+			fmt.Println(text)
+			err = getSpeechFromText(fmt.Sprintf("this was the users text %s \n my response is very cool, nice one , great, text,text text.", text), "final")
+			if err != nil {
+				fmt.Println("Failed to get audio from text:", err)
+				continue
+			}
+			err = convertMp3ToOgg("final")
+			if err != nil {
+				fmt.Println("Failed to get audio from text:", err)
+				continue
+			}
+			playAudio()
+		}
 	})
 
 	outputTrack, err = webrtc.NewTrackLocalStaticSample(
@@ -306,9 +313,6 @@ func createWebRtcConnection() {
 		panic(err)
 	}
 
-	// Read incoming RTCP packets
-	// Before these packets are returned they are processed by interceptors. For things
-	// like NACK this needs to be called.
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -322,11 +326,10 @@ func createWebRtcConnection() {
 }
 
 func main() {
-
+	closeChannel = make(chan bool)
 	http.HandleFunc("/offer", withCORS(offerHandler))
 	http.HandleFunc("/play", withCORS(func(w http.ResponseWriter, r *http.Request) { go playAudio() }))
-
-	//http.HandleFunc("/stop", withCORS(func(w http.ResponseWriter, r *http.Request) { go stopRecording() }))
+	http.HandleFunc("/stop", withCORS(func(w http.ResponseWriter, r *http.Request) { go stopRecording() }))
 	//http.HandleFunc("/start", withCORS(func(w http.ResponseWriter, r *http.Request) { go startRecording() }))
 
 	fmt.Println("starting webrtc server")
@@ -343,14 +346,14 @@ func main() {
 
 func stopRecording() {
 	fmt.Println("Stop")
-	//closeChannel <- true
+	closeChannel <- true
 	//isConnected <- true
 	fmt.Println("Added to closeChannel true")
 }
 
 func startRecording() {
 	fmt.Println("Start")
-	//closeChannel <- false
+	closeChannel <- false
 	fmt.Println("Added to closeChannel false")
 }
 
@@ -375,26 +378,19 @@ func decode(in string, obj *webrtc.SessionDescription) error {
 /* bad code, clean this shit out please */
 
 func playAudio() {
-
 	go func() {
-		// Open a OGG file and start reading using our OGGReader
 		file, oggErr := os.Open("final.ogg")
 		if oggErr != nil {
 			panic(oggErr)
 		}
 
-		// Open on oggfile in non-checksum mode.
 		ogg, _, oggErr := oggreader.NewWith(file)
 		if oggErr != nil {
 			panic(oggErr)
 		}
 
-		// Keep track of last granule, the difference is the amount of samples in the buffer
 		var lastGranule uint64
 
-		// It is important to use a time.Ticker instead of time.Sleep because
-		// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-		// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
 		ticker := time.NewTicker(oggPageDuration)
 		defer ticker.Stop()
 		for ; true; <-ticker.C {
@@ -408,7 +404,6 @@ func playAudio() {
 				panic(oggErr)
 			}
 
-			// The amount of samples is the difference between the last and current timestamp
 			sampleCount := float64(pageHeader.GranulePosition - lastGranule)
 			lastGranule = pageHeader.GranulePosition
 			sampleDuration := time.Duration((sampleCount/48000)*1000) * time.Millisecond
@@ -420,7 +415,6 @@ func playAudio() {
 			fmt.Println("sent audio")
 		}
 	}()
-	select {}
 }
 
 func offerHandler(w http.ResponseWriter, r *http.Request) {
@@ -466,7 +460,6 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
 	encoded := encode(peerConnection.LocalDescription())
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(encoded))
-
 }
 
 /* bad code, clean this shit out please */
